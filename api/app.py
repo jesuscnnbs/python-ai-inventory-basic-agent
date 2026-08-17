@@ -52,9 +52,15 @@ def get_inventory():
 
 @app.post("/inventory", status_code=201)
 def create_product(req: CreateProductRequest):
+    if req.quantity <= 0:
+        raise HTTPException(status_code=400, detail="Quantity must be greater than zero")
+    if not req.name.strip():
+        raise HTTPException(status_code=400, detail="Product name cannot be empty")
+    if not req.unit.strip():
+        raise HTTPException(status_code=400, detail="Unit cannot be empty")
     products = _read_products()
     new_id = _next_id(products)
-    new_product = {"id": str(new_id), "name": req.name, "quantity": str(req.quantity), "unit": req.unit}
+    new_product = {"id": str(new_id), "name": req.name.strip(), "quantity": str(req.quantity), "unit": req.unit.strip()}
     products.append(new_product)
     _write_products(products)
     new_product["quantity"] = int(new_product["quantity"])
@@ -63,6 +69,8 @@ def create_product(req: CreateProductRequest):
 
 @app.patch("/inventory/{product_id}")
 def update_stock(product_id: int, req: UpdateStockRequest):
+    if req.delta == 0:
+        raise HTTPException(status_code=400, detail="Delta must be non-zero")
     products = _read_products()
     for p in products:
         if int(p["id"]) == product_id:

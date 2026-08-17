@@ -13,6 +13,7 @@ load_dotenv()
 
 API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "qwen/qwen3.6-27b")
 USE_FAKE_LLM = os.getenv("USE_FAKE_LLM", "true").lower() in ("true", "1", "yes")
 
 LOG_FILE = os.path.join(os.path.dirname(__file__), "conversation_log.csv")
@@ -103,10 +104,14 @@ def _log_event(role: str, content: str):
         writer.writerow({"timestamp": timestamp, "role": role, "content": content})
 
 
+def _format_error(msg: str) -> str:
+    return json.dumps({"error": msg})
+
+
 def _execute_tool(tool_name: str, arguments: dict) -> str:
     handler = TOOL_HANDLERS.get(tool_name)
     if not handler:
-        result = json.dumps({"error": f"Unknown tool: {tool_name}"})
+        result = _format_error(f"Unknown tool: {tool_name}")
         _log_event("tool_result", result)
         return result
 
@@ -114,40 +119,42 @@ def _execute_tool(tool_name: str, arguments: dict) -> str:
         response = handler(**arguments)
         response.raise_for_status()
         result = response.text
+    except httpx.ConnectError:
+        result = _format_error(
+            "No se pudo conectar con la API. ¿Está corriendo el servidor? (uvicorn api.app:app --reload)"
+        )
     except httpx.HTTPStatusError as e:
-        result = json.dumps({"error": f"HTTP {e.response.status_code}", "detail": e.response.text})
+        try:
+            detail = e.response.json()
+            detail_str = detail.get("detail", str(detail))
+        except Exception:
+            detail_str = e.response.text
+        result = _format_error(detail_str)
     except Exception as e:
-        result = json.dumps({"error": str(e)})
+        result = _format_error(str(e))
 
     _log_event("tool_result", result)
     return result
 
 
+_STOCK = r"(?:actualizar|modificar|cambiar|aumentar|reducir|disminuir|retirar|quitar|sacar|sumar|restar|gastar|gastado)"
+_ADD = r"(?:añad\w*)"
+_CREATE = r"(?:crear|agregar|nuevo|alta|registrar)"
+
+
 def _llm_fake_response(messages: list[dict]) -> dict:
+    last_user_idx = -1
     last_user = ""
-    for msg in reversed(messages):
-        if msg["role"] == "user":
-            last_user = msg["content"].lower()
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i]["role"] == "user":
+            last_user_idx = i
+            last_user = messages[i]["content"].lower()
             break
 
-    system_msg = ""
-    for msg in messages:
-        if msg["role"] == "system":
-            system_msg = msg["content"].lower()
-            break
+    tool_results = [m for m in messages[last_user_idx + 1:] if m["role"] == "tool"]
 
-    last_assistant = ""
-    for msg in reversed(messages):
-        if msg["role"] == "assistant" and isinstance(msg.get("content"), str) and msg["content"]:
-            last_assistant = msg["content"].lower()
-            break
-
-    has_tool_results = any(msg["role"] == "tool" for msg in messages)
-
-    if has_tool_results:
-        results_text = "\n".join(
-            msg.get("content", "") for msg in messages if msg["role"] == "tool"
-        )
+    if tool_results:
+        results_text = "\n".join(m.get("content", "") for m in tool_results)
         return {"role": "assistant", "content": f"Procesé la información del inventario. Resultado: {results_text[:500]}"}
 
     combined = last_user
@@ -166,7 +173,7 @@ def _llm_fake_response(messages: list[dict]) -> dict:
             ],
         }
 
-    if re.search(r"\b(ver|mostrar|lista|consultar|inventario|qué hay|que hay|listar|productos)\b", combined):
+    if re.search(r"\b(ver|mostrar|lista|consultar|inventario|qué hay|que hay|listar)\b", combined):
         return {
             "role": "assistant",
             "tool_calls": [
@@ -178,11 +185,12 @@ def _llm_fake_response(messages: list[dict]) -> dict:
             ],
         }
 
-    if re.search(r"\b(actualizar|modificar|cambiar|aumentar|reducir|disminuir|retirar|quitar|sacar|añadir|agregar\s+(?:al|a)|sumar|restar)\b", combined):
-        id_match = re.search(r"(?:producto|id)\s*(\d+)", last_user)
-        product_id = int(id_match.group(1)) if id_match else 1
+    # update_stock: solo si hay ID explícito + keywords de modificación
+    id_match = re.search(r"(?:producto|id)\s*(\d+)", last_user)
+    if id_match and re.search(rf"\b(?:{_STOCK}|{_ADD})\b", combined):
+        product_id = int(id_match.group(1))
 
-        delta_sign = -1 if re.search(r"\b(reducir|disminuir|retirar|quitar|sacar)\b", last_user) else 1
+        delta_sign = -1 if re.search(r"\b(reducir|disminuir|retirar|quitar|sacar|gastar|gastado)\b", last_user) else 1
         qty_match = re.search(r"(\d+)\s*(?:unidades?|kilos?|kg|litros?|l|piezas?)", last_user)
         delta = int(qty_match.group(1)) * delta_sign if qty_match else 5 * delta_sign
 
@@ -200,17 +208,21 @@ def _llm_fake_response(messages: list[dict]) -> dict:
             ],
         }
 
-    if re.search(r"\b(crear|agregar|nuevo|alta|registrar)\b", combined):
+    if re.search(rf"\b(?:{_CREATE}|{_ADD})\b", combined):
         name_match = re.search(
             r'(?:producto|artículo)\s+(?:llamado|denominado\s+)?["\u201c]?([\w\sáéíóúüñÁÉÍÓÚÜÑ-]+?)["\u201d]?(?:\s|$|,)',
             last_user,
         )
         if not name_match:
             name_match = re.search(
-                r'(?:crear|agregar|nuevo|alta)\s+(?:producto\s+)?["\u201c]?([\w\sáéíóúüñÁÉÍÓÚÜÑ-]+?)["\u201d]?(?:\s|$|,)',
+                r'(?:crear|agregar|nuevo|alta|añad\w*)\s+(?:producto\s+)?["\u201c]?([\w\sáéíóúüñÁÉÍÓÚÜÑ-]+?)["\u201d]?(?:\s|$|,)',
                 last_user,
             )
-        name = name_match.group(1).strip() if name_match else "Producto nuevo"
+        if not name_match:
+            qty_match = re.search(r"(\d+\s*\w+)\s+de\s+([\w\sáéíóúüñÁÉÍÓÚÜÑ-]+?)$", last_user)
+            name = qty_match.group(2).strip() if qty_match else "Producto nuevo"
+        else:
+            name = name_match.group(1).strip()
 
         qty_match = re.search(r"(\d+)\s*(?:unidades?|kilos?|kg|litros?|l|piezas?)", last_user)
         quantity = int(qty_match.group(1)) if qty_match else 10
@@ -232,6 +244,12 @@ def _llm_fake_response(messages: list[dict]) -> dict:
             ],
         }
 
+    if re.search(rf"\b(?:{_STOCK}|{_ADD})\b", combined):
+        return {
+            "role": "assistant",
+            "content": "Para actualizar el stock necesito el ID del producto. Ejemplo: 'añadir 10 unidades al producto 1'"
+        }
+
     return {
         "role": "assistant",
         "content": "Soy un asistente de inventario. Puedo ayudarte a:\n"
@@ -244,7 +262,7 @@ def _llm_fake_response(messages: list[dict]) -> dict:
 
 def _llm_real_response(client: OpenAI, messages: list[dict]) -> dict:
     response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+        model=GROQ_MODEL,
         messages=messages,
         tools=TOOLS,
         tool_choice="auto",
@@ -270,15 +288,12 @@ def _llm_real_response(client: OpenAI, messages: list[dict]) -> dict:
     return result
 
 
+MAX_HISTORY_TURNS = 10
+
+
 def run():
-    print("\n=== Agente de Inventario ===\n")
-    user_input = input("Tú: ").strip()
-
-    if not user_input:
-        print("No ingresaste ningún mensaje.")
-        return
-
-    _log_event("user", user_input)
+    print("\n=== Agente de Inventario ===")
+    print("Escribe 'salir' o 'exit' para terminar.\n")
 
     system_prompt = (
         "Eres un asistente de gestión de inventario. "
@@ -286,10 +301,7 @@ def run():
         "Responde siempre en español."
     )
 
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_input},
-    ]
+    messages = [{"role": "system", "content": system_prompt}]
 
     if USE_FAKE_LLM:
         client = None
@@ -302,42 +314,56 @@ def run():
             api_key=GROQ_API_KEY,
         )
 
-    for iteration in range(1, MAX_ITERATIONS + 1):
-        if USE_FAKE_LLM:
-            llm_response = _llm_fake_response(messages)
+    while True:
+        user_input = input("Tú: ").strip()
+        if not user_input:
+            continue
+        if user_input.lower() in ("salir", "exit", "quit", "q"):
+            print("¡Hasta luego!")
+            break
+
+        _log_event("user", user_input)
+        messages.append({"role": "user", "content": user_input})
+
+        if len(messages) > MAX_HISTORY_TURNS * 2 + 1:
+            messages = [messages[0]] + messages[-(MAX_HISTORY_TURNS * 2):]
+
+        for iteration in range(1, MAX_ITERATIONS + 1):
+            if USE_FAKE_LLM:
+                llm_response = _llm_fake_response(messages)
+            else:
+                llm_response = _llm_real_response(client, messages)
+
+            content = llm_response.get("content", "") or ""
+            tool_calls = llm_response.get("tool_calls", [])
+
+            messages.append(llm_response)
+
+            if content:
+                log_content = content
+                if tool_calls:
+                    log_content = json.dumps({
+                        "content": content,
+                        "tool_calls": [
+                            {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]}
+                            for tc in tool_calls
+                        ],
+                    })
+                _log_event("assistant", log_content)
+
+            if not tool_calls:
+                print(f"\nAgente: {content}\n")
+                break
+
+            for tc in tool_calls:
+                tool_name = tc["function"]["name"]
+                arguments = json.loads(tc["function"]["arguments"])
+                print(f"  -> Llamando herramienta: {tool_name}({arguments})")
+
+                result = _execute_tool(tool_name, arguments)
+                messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
         else:
-            llm_response = _llm_real_response(client, messages)
-
-        content = llm_response.get("content", "") or ""
-        tool_calls = llm_response.get("tool_calls", [])
-
-        messages.append(llm_response)
-
-        if content:
-            log_content = content
-            if tool_calls:
-                log_content = json.dumps({
-                    "content": content,
-                    "tool_calls": [
-                        {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]}
-                        for tc in tool_calls
-                    ],
-                })
-            _log_event("assistant", log_content)
-
-        if not tool_calls:
-            print(f"\nAgente: {content}\n")
-            return
-
-        for tc in tool_calls:
-            tool_name = tc["function"]["name"]
-            arguments = json.loads(tc["function"]["arguments"])
-            print(f"  -> Llamando herramienta: {tool_name}({arguments})")
-
-            result = _execute_tool(tool_name, arguments)
-            messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
-
-    print("\nAgente: Alcanzado el límite máximo de iteraciones.")
+            print("\nAgente: Alcanzado el límite máximo de iteraciones.\n")
 
 
 if __name__ == "__main__":
